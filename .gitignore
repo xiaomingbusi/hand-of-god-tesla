@@ -1,0 +1,28 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== 高德 API Key（绝不入库，泄露会被盗刷配额）=====
+amap_key.txt
+
+# ===== 地图瓦片缓存 =====
+.map_cache/
+
+# ===== 行车视频与行车数据（含 GPS，隐私敏感且体积大）=====
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.csv
+*.json
+
+# ===== 系统/编辑器杂项 =====
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
