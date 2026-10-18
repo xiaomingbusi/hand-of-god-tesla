@@ -28,7 +28,37 @@ Tesla dashcam telemetry overlay — restore speed, pedals, blinkers, autopilot s
 
 ## 效果展示
 
-> （发布前在此放 2~3 张对比图或一个演示 GIF：原始画面 / 叠加后画面）
+![原始画面与SEI数据还原叠加效果演示](docs/images/demo-overlay.gif)
+
+### 彩虹之路，六路同框
+
+在**全部 6 路摄像头**（前 / 后 / 左B柱 / 右B柱 / 左翼子板 / 右翼子板）同步还原彩虹之路，且彩虹的流动速度随真实车速实时变化——原厂反而是匀速的。
+
+![Rainbow Road restored on all 6 dashcam cameras](docs/images/demo-rainbow-6cameras.gif)
+
+### 过减速带？弹簧车陪你一起颠
+
+右下角的小车根据真实的 **Z 轴垂直 G 值**（vertical G-force）实时弹跳：压上减速带时悬挂压缩、随后回弹。下图这段实测峰峰值达到 **0.8g**，前轮、后轮两次冲击清晰可见。
+
+![过减速带时0.8g垂直G值，弹簧小车同步弹跳](docs/images/demo-vertical-gforce.gif)
+
+### 一个球看清你的每脚油门、刹车和方向
+
+左下角的 **G 值球**（G-Meter）实时显示横向 + 纵向的合成加速度：加速时球向后仰（推背），刹车时向前冲（点头），过弯时甩向弯外。
+
+![G值球实时显示加速刹车过弯的横向纵向G力](docs/images/demo-g-meter.gif)
+
+### 三层地图：没网也能用，有网自动升级
+
+右下角地图按网络条件自动切换，任何环境都能出片：
+
+<table>
+<tr>
+<td width="33%"><img src="docs/images/map-builtin.png"><br><b>① 内置示意地图</b><br>无网络时的兜底方案：根据 GPS 坐标绘制指北针、经纬坐标和简化路网，保证永远有图</td>
+<td width="33%"><img src="docs/images/map-osm.png"><br><b>② OpenStreetMap</b><br>有网络自动启用：开源街景地图，真实道路和路名，定位精准，无需任何配置</td>
+<td width="34%"><img src="docs/images/map-amap.png"><br><b>③ 高德地图</b><br>配置免费 Key 后启用：样式更美观、国内道路信息最新（图片保留高德版权标识）</td>
+</tr>
+</table>
 
 ---
 

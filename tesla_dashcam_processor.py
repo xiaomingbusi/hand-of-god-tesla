@@ -652,14 +652,36 @@ def _autocorr_period(video_path, speeds, meas_fps=36.0, width=480, step=0.02):
     import numpy as np
     tmp = tempfile.mkdtemp(prefix='rainbow_meas_')
     try:
-        subprocess.run(['ffmpeg', '-v', 'quiet', '-y', '-i', video_path,
-                        '-vf', 'fps=%g,scale=%d:-2' % (meas_fps, width),
-                        '-pix_fmt', 'gray', os.path.join(tmp, 'f_%05d.png')],
-                       capture_output=True, text=True, encoding='utf-8', errors='replace')
+        try:
+            dur_ms = get_video_info(video_path)[0]
+            est = int(dur_ms / 1000 * meas_fps)
+        except Exception:
+            est = 0
+        print(f"校准 1/2: 抽取分析帧(预计约{est}帧,需几分钟)...", flush=True)
+        proc = subprocess.Popen(['ffmpeg', '-v', 'quiet', '-y', '-i', video_path,
+                                 '-vf', 'fps=%g,scale=%d:-2' % (meas_fps, width),
+                                 '-pix_fmt', 'gray', os.path.join(tmp, 'f_%05d.png')],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        last_pct = -10
+        while proc.poll() is None:
+            n = len(glob.glob(os.path.join(tmp, 'f_*.png')))
+            if est:
+                pct = n * 100 // est
+                if pct >= last_pct + 10:
+                    print(f"  抽帧进度: {n}/{est} ({pct}%)", flush=True)
+                    last_pct = pct
+            time.sleep(2)
         files = sorted(glob.glob(os.path.join(tmp, 'f_*.png')))
+        print(f"  抽帧完成: {len(files)} 帧", flush=True)
         if len(files) < 60:
             return None
-        frames = np.stack([np.asarray(Image.open(f), dtype=np.float32) for f in files])
+        print(f"校准 2/2: 载入并分析车道虚线({len(files)}帧)...", flush=True)
+        imgs = []
+        for i, f in enumerate(files):
+            imgs.append(np.asarray(Image.open(f), dtype=np.float32))
+            if (i + 1) % 500 == 0 or i + 1 == len(files):
+                print(f"  读帧进度: {i + 1}/{len(files)}", flush=True)
+        frames = np.stack(imgs)
         n, h, w = frames.shape
         sp = np.asarray(speeds, dtype=np.float64)
         v = sp[np.clip(np.arange(n), 0, len(sp) - 1)] / meas_fps
@@ -1951,8 +1973,17 @@ def generate_overlay_frames(sei_data, output_dir, base_time, video_width=1920, v
     _blinker_state.update(left_prev=False, left_start=0, right_prev=False, right_start=0)
     os.makedirs(output_dir, exist_ok=True)
 
+    total = len(sei_data)
+    render_start = time.time()
     for i, sei in enumerate(sei_data):
         generate_overlay_frame(sei, i, output_dir, base_time, video_width, video_height, use_metric, event, camera)
+        # 每 100 帧或最后一帧打印进度，避免长时间静默让人误以为卡死
+        if (i + 1) % 100 == 0 or (i + 1) == total:
+            elapsed = time.time() - render_start
+            pct = (i + 1) / total * 100
+            eta = elapsed / (i + 1) * (total - i - 1)
+            print(f"  渲染进度: {i + 1}/{total} ({pct:.0f}%)  已用 {elapsed:.0f}s  预计剩余 {eta:.0f}s",
+                  flush=True)
 
     return len(sei_data)
 
@@ -2039,8 +2070,10 @@ def process_video(input_video, input_csv, output_video, use_metric=True):
     # 自动测量本段道路的真实虚线周期（结果缓存复用），用于把彩虹按「米」铺在路面上；
     # 全程未开启辅助驾驶时不会画彩虹，无需测量
     if any(s['autopilot_state'] in ('AUTOSTEER', 'SELF_DRIVING') for s in sei_data):
+        print("检测到辅助转向开启，正在校准彩虹之路路面参数（结果会缓存，仅首次较慢）...", flush=True)
         RAINBOW_CALIB['period_m'], RAINBOW_CALIB['source'] = measure_dash_period(
             input_video, input_csv, camera)
+    print("开始逐帧渲染（高分辨率前视视频可能需要十几分钟，请耐心等待）...", flush=True)
     generate_overlay_frames(sei_data, temp_dir, base_time, video_width, video_height, use_metric, event, camera)
     print(f"Generated overlay frames in {temp_dir}")
 
