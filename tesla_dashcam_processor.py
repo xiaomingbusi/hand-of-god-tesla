@@ -117,6 +117,12 @@ AMAP_MAX_SIZE = 1024                     # 高德静态图单边最大像素
 MAP_SOURCE_ORDER = ('amap', 'osm')       # 取图数据源优先级
 MAP_ALPHA = 255  # 真实地图贴入卡片时的不透明度（0-255，255=完全不透明的原始地图）
 
+# ===== 动态地图：CSV 逐帧 GPS → 地图随车移动（海外/有定位场景）=====
+# 预取一次覆盖整条路线的瓦片画布并缓存，逐帧只做 crop，避免「每帧一次取图」打爆瓦片源
+DYNAMIC_MAP_MIN_VALID = 5        # 有效 GPS 帧数下限，低于则视为无逐帧定位
+DYNAMIC_MAP_MAX_TILES = 256      # 单条路线瓦片数上限，超长路线自动降缩放级别
+DYNAMIC_MAP_MIN_ZOOM = 10        # 自动降缩放的下限
+
 # Sentry Six 源代码中的转向灯 SVG 路径 (从 index.html 提取)
 SVG_ARROW_LEFT = 'M-13.11,-33.71 C-15.61,-33.7 -16.06,-36.09 -15.15,-38.05 C-9.81,-49.52 -5.3,-59.32 -1.63,-67.45 C1.42,-74.21 -0.76,-78.22 -5.55,-83.46 C-5.8,-83.72 -6.07,-83.94 -6.38,-84.12 C-14.17,-88.49 -20.03,-84.98 -25.77,-79.01 C-36.67,-67.69 -45.88,-58.89 -57.03,-47.37 C-62.85,-41.36 -73.29,-30.89 -88.34,-15.96 C-91.84,-12.49 -95.74,-8.94 -97.13,-4.62 C-99.07,1.36 -96.56,6.15 -92.31,10.41 C-59.34,43.5 -38.6,64.39 -30.11,73.08 C-27.75,75.49 -26.47,76.81 -26.28,77.03 C-23.64,80 -20.08,83.56 -16.05,83.93 C-13.88,84.12 -11.77,84.13 -9.72,83.94 C-9.38,83.91 -9.05,83.83 -8.73,83.7 C-1.64,80.77 1.19,75.32 -0.25,67.36 C-0.32,66.99 -0.43,66.63 -0.58,66.29 C-5.37,55.61 -9.91,45.68 -14.2,36.51 C-15.9,32.89 -13.31,31.3 -10.28,31.29 C5.65,31.24 34.48,31.23 76.21,31.24 C83.28,31.24 87.73,30.78 89.56,29.85 C93.33,27.94 96.02,24.45 97.65,19.38 C97.74,19.08 97.79,18.76 97.79,18.44 L97.73,-20.92 C97.73,-21.05 97.71,-21.18 97.68,-21.31 C96.46,-26.68 93.59,-30.44 89.07,-32.6 C87.14,-33.53 83.84,-33.99 79.19,-33.98 C43.76,-33.92 13,-33.83 -13.11,-33.71Z'
 
@@ -1560,10 +1566,189 @@ def prefetch_map_image(event, video_width, video_height):
         print(f"Map: 使用 {source_name} ({map_w}x{map_h})")
 
 
+# ===== 动态地图：CSV 逐帧 GPS → 预取整条路线瓦片画布 → 逐帧裁剪 =====
+# 画布与取图参数在渲染前一次性锁定，逐帧只做 crop；无有效逐帧 GPS 时整段回退静态地图
+_dynamic_map = {'active': False, 'track': None, 'mosaic': None, 'zoom': None, 'x0': 0, 'y0': 0}
+
+
+def _build_gps_track(sei_data):
+    """把逐帧数据整理成与帧对齐的 (lat, lon, heading) 列表；无效返回 None。
+
+    降级判据（任一命中即返回 None，由调用方回退 event.json 静态地图）：
+      - 缺 latitude_deg/longitude_deg 列
+      - 坐标全为 0（国内车机当前现状）
+      - 有效点数量少于 DYNAMIC_MAP_MIN_VALID
+      - 有效点几乎重合（没有实际位移）
+    个别 0 值帧用最近的有效点补全，避免地图中途乱跳。
+    """
+    raw = []
+    for s in sei_data:
+        try:
+            lat = float(s['latitude_deg'])
+            lon = float(s['longitude_deg'])
+        except (KeyError, ValueError, TypeError):
+            lat = lon = 0.0
+        if (lat == 0.0 and lon == 0.0) or not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raw.append(None)
+            continue
+        try:
+            heading = float(s.get('heading_deg', 0.0))
+        except (ValueError, TypeError):
+            heading = 0.0
+        raw.append((lat, lon, heading))
+
+    valid_idx = [i for i, p in enumerate(raw) if p is not None]
+    if len(valid_idx) < DYNAMIC_MAP_MIN_VALID:
+        return None
+    lats = [raw[i][0] for i in valid_idx]
+    lons = [raw[i][1] for i in valid_idx]
+    if (max(lats) - min(lats)) < 1e-5 and (max(lons) - min(lons)) < 1e-5:
+        return None
+
+    # 首段回填 + 中间空洞用最近的有效点前向填充
+    first = valid_idx[0]
+    track = list(raw)
+    for i in range(first):
+        track[i] = raw[first]
+    last = raw[first]
+    for i in range(first + 1, len(track)):
+        if track[i] is None:
+            track[i] = last
+        else:
+            last = track[i]
+    return track
+
+
+def _dynamic_tile_range(track, map_w, map_h):
+    """选一个能把整条路线装进瓦片预算的最高缩放级别。
+    返回 (zoom, tx0, ty0, tx1, ty1)；任何级别都装不下时返回 None。"""
+    lats = [p[0] for p in track]
+    lons = [p[1] for p in track]
+    min_lat, max_lat = min(lats), max(lats)
+    min_lon, max_lon = min(lons), max(lons)
+    # 窗口半宽换算成瓦片数：保证路线任意一帧都能裁出完整窗口
+    pad_x = (map_w / 2.0) / MAP_TILE_SIZE
+    pad_y = (map_h / 2.0) / MAP_TILE_SIZE
+    for zoom in range(MAP_ZOOM, DYNAMIC_MAP_MIN_ZOOM - 1, -1):
+        xs, ys = [], []
+        for la, lo in ((min_lat, min_lon), (min_lat, max_lon),
+                       (max_lat, min_lon), (max_lat, max_lon)):
+            x, y = _latlon_to_tile_xy(la, lo, zoom)
+            xs.append(x)
+            ys.append(y)
+        tx0 = int(math.floor(min(xs) - pad_x))
+        tx1 = int(math.floor(max(xs) + pad_x))
+        ty0 = int(math.floor(min(ys) - pad_y))
+        ty1 = int(math.floor(max(ys) + pad_y))
+        if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= DYNAMIC_MAP_MAX_TILES:
+            return zoom, tx0, ty0, tx1, ty1
+    return None
+
+
+def _dynamic_mosaic_cache_path(zoom, tx0, ty0, tx1, ty1):
+    key = f"dyn_{zoom}_{tx0}_{ty0}_{tx1}_{ty1}"
+    return os.path.join(MAP_CACHE_DIR, hashlib.md5(key.encode()).hexdigest() + '.png')
+
+
+def _build_dynamic_mosaic(track, map_w, map_h):
+    """预取整条路线的瓦片并拼成一张大画布，返回 (mosaic, zoom, x0, y0)；失败返回 None。
+    画布落盘缓存（键为瓦片范围），重渲同一路线不重复下载。"""
+    rng = _dynamic_tile_range(track, map_w, map_h)
+    if rng is None:
+        print("Map: 路线跨度过大，无法预取动态地图，回退静态地图")
+        return None
+    zoom, tx0, ty0, tx1, ty1 = rng
+
+    path = _dynamic_mosaic_cache_path(zoom, tx0, ty0, tx1, ty1)
+    if os.path.exists(path):
+        try:
+            mosaic = Image.open(path).convert('RGB')
+            os.utime(path, None)  # 命中缓存刷新 mtime，供 LRU 淘汰
+            print(f"Map: 动态地图画布命中缓存 ({mosaic.width}x{mosaic.height})")
+            return mosaic, zoom, tx0, ty0
+        except Exception:
+            pass
+
+    n = 2 ** zoom
+    cols, rows = tx1 - tx0 + 1, ty1 - ty0 + 1
+    mosaic = Image.new('RGB', (cols * MAP_TILE_SIZE, rows * MAP_TILE_SIZE), (30, 34, 38))
+    # 越界的瓦片行（极区外）跳过，不计入总数
+    targets = [(tx, ty) for ty in range(ty0, ty1 + 1) if 0 <= ty < n
+               for tx in range(tx0, tx1 + 1)]
+    print(f"Map: 预取动态地图画布 {cols}x{rows}={len(targets)} 张瓦片 (zoom {zoom}) ...")
+
+    def _paste_tile(tx, ty):
+        tile = _fetch_tile(zoom, tx % n, ty)
+        mosaic.paste(tile, ((tx - tx0) * MAP_TILE_SIZE, (ty - ty0) * MAP_TILE_SIZE))
+
+    failed = []
+    for tx, ty in targets:
+        try:
+            _paste_tile(tx, ty)
+        except Exception:
+            failed.append((tx, ty))
+    # 失败瓦片重试一轮（多为瞬时网络抖动，尽量不留黑洞）
+    retry, failed = failed, []
+    for tx, ty in retry:
+        try:
+            _paste_tile(tx, ty)
+        except Exception:
+            failed.append((tx, ty))
+
+    got = len(targets) - len(failed)
+    if got == 0:
+        print("Map: 动态地图瓦片全部获取失败，回退静态地图")
+        return None
+    if failed:
+        # 有缺口时不落盘，留给下次渲染重试，避免把黑洞永久固化进缓存
+        print(f"Map: 动态地图画布就绪（{got}/{len(targets)} 张瓦片，{len(failed)} 张缺失，本次不缓存）")
+        return mosaic, zoom, tx0, ty0
+    try:
+        os.makedirs(MAP_CACHE_DIR, exist_ok=True)
+        mosaic.save(path)
+        _evict_map_cache()
+    except OSError:
+        pass
+    print(f"Map: 动态地图画布就绪（{got}/{len(targets)} 张瓦片，已缓存）")
+    return mosaic, zoom, tx0, ty0
+
+
+def prefetch_dynamic_map(sei_data, video_width, video_height):
+    """渲染前构建动态地图状态；CSV 无有效逐帧 GPS 时返回 False（由调用方降级静态地图）。"""
+    _dynamic_map.update(active=False, track=None, mosaic=None, zoom=None, x0=0, y0=0)
+    track = _build_gps_track(sei_data)
+    if track is None:
+        return False
+    map_w = int(video_width * 0.30)
+    map_h = int(video_height * 0.17)
+    result = _build_dynamic_mosaic(track, map_w, map_h)
+    if result is None:
+        return False
+    mosaic, zoom, x0, y0 = result
+    _dynamic_map.update(active=True, track=track, mosaic=mosaic, zoom=zoom, x0=x0, y0=y0)
+    return True
+
+
+def _crop_dynamic_map(lat, lon, map_w, map_h):
+    """从预取画布里裁出以 (lat, lon) 为中心的窗口，实现地图随车移动。"""
+    st = _dynamic_map
+    if not st['active'] or st['mosaic'] is None:
+        return None
+    cx, cy = _latlon_to_tile_xy(lat, lon, st['zoom'])
+    px = (cx - st['x0']) * MAP_TILE_SIZE - map_w / 2.0
+    py = (cy - st['y0']) * MAP_TILE_SIZE - map_h / 2.0
+    m = st['mosaic']
+    px = max(0.0, min(px, max(0, m.width - map_w)))
+    py = max(0.0, min(py, max(0, m.height - map_h)))
+    px, py = int(round(px)), int(round(py))
+    return m.crop((px, py, px + map_w, py + map_h))
+
+
 def draw_minimap(img, draw, event, video_width, video_height, scale, font_map, font_map_small, frame_index=0):
     """GTA 风格缩略地图，显示在右上角，与左上角信息卡同尺寸对称。
     不套外框：地图直接铺满整个圆角区域（位置/大小/圆角与左卡一致）。
-    优先高德静态图，其次 OSM；取图失败时回退为经纬度种子生成的伪路网。"""
+    逐帧有 GPS（海外）时用预取画布裁出「随车移动」的地图；否则用 event.json
+    单点静态地图（高德优先，OSM 后备）；取图失败统一回退为伪路网。"""
     # —— 几何：与左上角信息卡严格对称（同宽同高同圆角），但无外框 ——
     card_margin = int(40 * scale)
     map_w = int(video_width * 0.30)
@@ -1571,26 +1756,39 @@ def draw_minimap(img, draw, event, video_width, video_height, scale, font_map, f
     mx, my = video_width - card_margin - map_w, card_margin
     corner_r = round(map_h * 0.13)
 
+    # —— 数据源：优先 CSV 逐帧 GPS（动态移动地图），否则 event.json 单点静态地图 ——
+    lat = lon = None
+    heading = None
+    dynamic = False
+    track = _dynamic_map['track']
+    if _dynamic_map['active'] and track:
+        idx = min(max(frame_index, 0), len(track) - 1)
+        lat, lon, heading = track[idx]
+        dynamic = True
+    elif event:
+        try:
+            lat, lon = float(event['est_lat']), float(event['est_lon'])
+        except (ValueError, TypeError, KeyError):
+            lat = lon = None
+
     # 地图单独图层：圆角遮罩直接铺满卡片区域，合成到画面上
     layer = Image.new('RGBA', (map_w, map_h), (0, 0, 0, 0))
     ld = ImageDraw.Draw(layer)
 
-    # 优先贴真实地图（高德/OSM）；取图失败自动回退到伪路网
+    # 取图：动态裁剪预取画布 / 静态整图；都失败时回退伪路网
     real_map = None
     map_source = 'osm'
-    try:
-        lat, lon = float(event['est_lat']), float(event['est_lon'])
+    if dynamic and lat is not None:
+        real_map = _crop_dynamic_map(lat, lon, map_w, map_h)
+    elif lat is not None:
         real_map = get_map_image(lat, lon, map_w, map_h)
-    except (ValueError, TypeError, KeyError):
-        lat = lon = None
-        real_map = None
+        if real_map is not None:
+            map_source = get_map_source(lat, lon, map_w, map_h)
 
     # 底部信息条（坐标 + 数据源署名），半透明黑底保证文字可读
     strip_h = max(16, int(24 * scale))
 
     if real_map is not None:
-        if lat is not None:
-            map_source = get_map_source(lat, lon, map_w, map_h)
         rm = real_map.convert('RGBA')
         rm.putalpha(MAP_ALPHA)  # 地图半透明，视频画面可微微透出，与其他两卡风格统一
         layer.paste(rm, (0, 0), rm)
@@ -1598,7 +1796,8 @@ def draw_minimap(img, draw, event, video_width, video_height, scale, font_map, f
         # —— 回退：用经纬度做种子生成确定性的伪路网（同一事件每次画出来一样）——
         ld.rectangle([0, 0, map_w - 1, map_h - 1], fill=(12, 18, 24, 235))
         try:
-            seed = int(float(event['est_lat']) * 1000) + int(float(event['est_lon']) * 1000)
+            s_lat, s_lon = (track[0][0], track[0][1]) if (dynamic and track) else (lat, lon)
+            seed = int(s_lat * 1000) + int(s_lon * 1000)
         except (ValueError, TypeError):
             seed = 42
         rng = (seed * 2654435761) % (2 ** 32)
@@ -1658,14 +1857,35 @@ def draw_minimap(img, draw, event, video_width, video_height, scale, font_map, f
     layer = Image.alpha_composite(layer, ripple)
     ld = ImageDraw.Draw(layer)
 
-    # —— 定位点本体：实心蓝点 + 白描边（导航惯例：高德小蓝点/特斯拉定位箭头）——
-    ld.ellipse([cx0 - dot_r, cy0 - dot_r, cx0 + dot_r, cy0 + dot_r],
-               fill=MAP_DOT_BLUE, outline=(255, 255, 255), width=max(1, int(2 * scale)))
+    # —— 定位点本体 ——
+    if dynamic and heading is not None:
+        # 动态地图：朝向箭头（随 heading 旋转，导航惯例：特斯拉定位箭头）
+        # heading 以正北顺时针计；屏幕上方为北，故前向 = (sinθ, -cosθ)
+        ang = math.radians(heading)
+        fx, fy = math.sin(ang), -math.cos(ang)      # 前向单位向量
+        rx, ry = math.cos(ang), math.sin(ang)       # 右向单位向量
+        size = dot_r * 1.9
+        tip = (cx0 + fx * size, cy0 + fy * size)
+        lb = (cx0 - fx * size * 0.55 + rx * size * 0.62,
+              cy0 - fy * size * 0.55 + ry * size * 0.62)
+        rb = (cx0 - fx * size * 0.55 - rx * size * 0.62,
+              cy0 - fy * size * 0.55 - ry * size * 0.62)
+        ld.polygon([tip, lb, rb], fill=MAP_DOT_BLUE, outline=(255, 255, 255))
+    else:
+        # 静态地图：实心蓝点 + 白描边（导航惯例：高德小蓝点）
+        ld.ellipse([cx0 - dot_r, cy0 - dot_r, cx0 + dot_r, cy0 + dot_r],
+                   fill=MAP_DOT_BLUE, outline=(255, 255, 255), width=max(1, int(2 * scale)))
 
     # 信息条左侧：经纬度小字；右侧：OSM 署名
     # （高德静态图自带「高德地图」水印署名，无需再画；用 ASCII (c) 避免黑体缺 © 字形）
+    if dynamic and lat is not None:
+        coord_text = f"{lat:.4f}, {lon:.4f}"          # 动态地图：随帧刷新当前坐标
+    elif event:
+        coord_text = f"{event['est_lat']}, {event['est_lon']}"
+    else:
+        coord_text = '--'
     ld.text((int(10 * scale), map_h - strip_h / 2 - int(scale)),
-            f"{event['est_lat']}, {event['est_lon']}",
+            coord_text,
             font=font_map_small, fill=COLORS['dim_white'], anchor='lm')
     if real_map is not None and map_source == 'osm':
         ld.text((map_w - int(8 * scale), map_h - strip_h / 2 - int(scale)),
@@ -1958,8 +2178,8 @@ def generate_overlay_frame(sei, frame_index, output_dir, base_time, video_width=
     draw_vertical_g_meter(img, draw, video_width, video_height, vg_size, gz, gf_margin,
                           brake_applied=sei['brake_applied'])
 
-    # event.json 相关元素（没有 event.json 时自动跳过；触发原因已移至左上角信息条）
-    if event:
+    # 地图：CSV 有逐帧 GPS 时走动态地图（不依赖 event.json）；否则 event.json 静态地图
+    if event or _dynamic_map['active']:
         draw_minimap(img, draw, event, video_width, video_height, scale, font_map, font_map_small, frame_index)
 
     output_path = os.path.join(output_dir, f'overlay_{frame_index:06d}.png')
@@ -2060,8 +2280,12 @@ def process_video(input_video, input_csv, output_video, use_metric=True):
     print(f"Video duration: {video_duration:.1f}ms")
     print(f"Video resolution: {video_width}x{video_height}")
 
-    # 渲染前一次性取好地图，确保整段视频一致（避免开头一瞬显示伪路网）
-    prefetch_map_image(event, video_width, video_height)
+    # 渲染前锁定地图方案：CSV 有逐帧 GPS 用动态（移动）地图，否则用 event.json 静态地图
+    # （两者都提前一次性取图/取瓦片，确保整段视频一致，避免开头一瞬显示伪路网）
+    if prefetch_dynamic_map(sei_data, video_width, video_height):
+        print("Map: 检测到逐帧 GPS，启用动态（移动）地图")
+    else:
+        prefetch_map_image(event, video_width, video_height)
 
     base_time = parse_video_timestamp(input_video)
     print(f"Video recording time: {base_time}")
