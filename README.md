@@ -4,6 +4,9 @@
 
 Tesla dashcam telemetry overlay — restore speed, pedals, blinkers, autopilot status, G-force and maps onto your USB clips.
 
+> **关于作者**：我不是程序员，也不懂代码，这个项目的代码全部由 AI 编程助手（Trae）生成。
+> 功能是我拿真实行车视频一段段测出来的；AI 写的代码不代表完美，如果你发现代码层面的问题，欢迎提 Issue，我会继续让 AI 修。
+
 ---
 
 ## 这是什么
