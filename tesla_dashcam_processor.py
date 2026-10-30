@@ -18,6 +18,12 @@ from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageFilter
 from datetime import datetime, timedelta
 
+# windowed 打包（无控制台）时 sys.stdout/stderr 为 None，先兜底，GUI 启动后会替换为窗口日志
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w', encoding='utf-8')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+
 GRAVITY = 9.81
 GFORCE_SCALE = 25
 GFORCE_HISTORY_MAX = 3
@@ -163,6 +169,9 @@ gforce_history = []
 # 转向灯闪烁相位状态：以激活帧为周期起点（对齐 Sentry-Six），每个视频开始时重置
 _blinker_state = {'left_prev': False, 'left_start': 0, 'right_prev': False, 'right_start': 0}
 _icon_cache = {}
+_PROGRESS_HOOK = None  # GUI 注册的渲染进度回调 func(done, total)
+# windowed 程序里调用 ffmpeg/ffprobe 时不再弹黑色控制台窗口
+_SUBPROCESS_FLAGS = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
 
 
 def parse_svg_path(path_str):
@@ -698,7 +707,8 @@ def _autocorr_period(video_path, speeds, meas_fps=36.0, width=480, step=0.02):
         proc = subprocess.Popen([FFMPEG, '-v', 'quiet', '-y', '-i', video_path,
                                  '-vf', 'fps=%g,scale=%d:-2' % (meas_fps, width),
                                  '-pix_fmt', 'gray', os.path.join(tmp, 'f_%05d.png')],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                creationflags=_SUBPROCESS_FLAGS)
         last_pct = -10
         while proc.poll() is None:
             n = len(glob.glob(os.path.join(tmp, 'f_*.png')))
@@ -2235,6 +2245,11 @@ def generate_overlay_frames(sei_data, output_dir, base_time, video_width=1920, v
             eta = elapsed / (i + 1) * (total - i - 1)
             print(f"  渲染进度: {i + 1}/{total} ({pct:.0f}%)  已用 {elapsed:.0f}s  预计剩余 {eta:.0f}s",
                   flush=True)
+        if _PROGRESS_HOOK and ((i + 1) % 20 == 0 or (i + 1) == total):
+            try:
+                _PROGRESS_HOOK(i + 1, total)
+            except Exception:
+                pass
 
     return len(sei_data)
 
@@ -2243,7 +2258,8 @@ def get_video_info(video_path):
     result = subprocess.run(
         [FFPROBE, '-v', 'quiet', '-print_format', 'json',
          '-show_entries', 'format=duration', video_path],
-        capture_output=True, text=True, encoding='utf-8', errors='replace'
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
+        creationflags=_SUBPROCESS_FLAGS
     )
     data = json.loads(result.stdout)
     duration_ms = float(data['format']['duration']) * 1000
@@ -2251,7 +2267,8 @@ def get_video_info(video_path):
     result = subprocess.run(
         [FFPROBE, '-v', 'quiet', '-print_format', 'json',
          '-show_entries', 'stream=width,height', video_path],
-        capture_output=True, text=True, encoding='utf-8', errors='replace'
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
+        creationflags=_SUBPROCESS_FLAGS
     )
     data = json.loads(result.stdout)
     streams = data.get('streams', [])
@@ -2268,7 +2285,8 @@ def get_video_duration(video_path):
     result = subprocess.run(
         [FFPROBE, '-v', 'quiet', '-print_format', 'json',
          '-show_entries', 'format=duration', video_path],
-        capture_output=True, text=True, encoding='utf-8', errors='replace'
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
+        creationflags=_SUBPROCESS_FLAGS
     )
     data = json.loads(result.stdout)
     return float(data['format']['duration']) * 1000
@@ -2346,7 +2364,8 @@ def process_video(input_video, input_csv, output_video, use_metric=True):
 
     print(f"Running FFmpeg command...")
     result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True,
-                            encoding='utf-8', errors='replace')
+                            encoding='utf-8', errors='replace',
+                            creationflags=_SUBPROCESS_FLAGS)
     shutil.rmtree(temp_dir, ignore_errors=True)
     if result.returncode != 0:
         print(f"FFmpeg error: {result.stderr}")
@@ -2394,50 +2413,178 @@ def process_csv_only(input_path):
         print(f"Extracted {len(sei_data)} frames -> {csv_path}")
 
 
-def choose_target_gui():
-    """双击启动时弹出的选择窗口，返回视频/文件夹路径；无图形环境返回 None"""
+def launch_gui(initial_path=None, use_metric=True, auto_start=False):
+    """图形界面：选文件、开始处理、显示进度与日志；无图形环境时返回 False"""
     try:
+        import threading
+        import traceback
         import tkinter as tk
-        from tkinter import filedialog
+        from tkinter import filedialog, ttk, messagebox
+        from tkinter.scrolledtext import ScrolledText
     except Exception:
-        return None
+        return False
 
-    result = {'path': None}
+    global _PROGRESS_HOOK
+
     root = tk.Tk()
     root.title('上帝之手 · 特斯拉行车视频还原')
-    root.geometry('430x200')
-    root.resizable(False, False)
+    root.geometry('640x540')
+    root.minsize(560, 480)
     try:
         root.iconbitmap(os.path.join(ICON_PATH, 'HandOfGod.ico'))
     except Exception:
         pass
 
-    tk.Label(root, text='选择要还原的 Tesla 行车视频',
-             font=('Microsoft YaHei', 12, 'bold')).pack(pady=(20, 4))
-    tk.Label(root, text='成片保存在原视频同目录，文件名带 _with_overlay',
-             font=('Microsoft YaHei', 9), fg='#666666').pack()
+    state = {'output_dir': None, 'running': False}
+
+    tk.Label(root, text='上帝之手 · 特斯拉行车视频还原',
+             font=('Microsoft YaHei', 14, 'bold')).pack(anchor='w', padx=16, pady=(14, 2))
+    tk.Label(root, text='选择视频文件或事件文件夹，成片生成在原目录（文件名带 _with_overlay）',
+             font=('Microsoft YaHei', 9), fg='#666666').pack(anchor='w', padx=16)
+
+    row = tk.Frame(root)
+    row.pack(fill='x', padx=16, pady=(12, 4))
+    path_var = tk.StringVar(value=initial_path or '')
+    tk.Entry(row, textvariable=path_var, font=('Microsoft YaHei', 9)).pack(
+        side='left', fill='x', expand=True, ipady=4)
 
     def pick_file():
         path = filedialog.askopenfilename(
             title='选择视频文件',
             filetypes=[('MP4 视频', '*.mp4'), ('所有文件', '*.*')])
         if path:
-            result['path'] = path
-            root.destroy()
+            path_var.set(path)
 
     def pick_dir():
         path = filedialog.askdirectory(title='选择事件文件夹（含 MP4 与 event.json）')
         if path:
-            result['path'] = path
-            root.destroy()
+            path_var.set(path)
 
-    btns = tk.Frame(root)
-    btns.pack(pady=18)
-    tk.Button(btns, text='选择视频文件', width=14, command=pick_file).pack(side='left', padx=8)
-    tk.Button(btns, text='选择事件文件夹', width=14, command=pick_dir).pack(side='left', padx=8)
+    tk.Button(row, text='选视频', width=8, command=pick_file).pack(side='left', padx=(6, 0))
+    tk.Button(row, text='选文件夹', width=9, command=pick_dir).pack(side='left', padx=(6, 0))
+
+    action = tk.Frame(root)
+    action.pack(fill='x', padx=16, pady=(6, 4))
+    start_btn = tk.Button(action, text='开始处理', width=14, font=('Microsoft YaHei', 10, 'bold'))
+    start_btn.pack(side='left')
+    open_btn = tk.Button(action, text='打开输出目录', width=12, state='disabled')
+    open_btn.pack(side='left', padx=8)
+
+    progress = ttk.Progressbar(root, mode='determinate', maximum=100, value=0)
+    progress.pack(fill='x', padx=16, pady=(2, 4))
+    status_var = tk.StringVar(value='选择视频或文件夹后点“开始处理”')
+    tk.Label(root, textvariable=status_var, anchor='w',
+             font=('Microsoft YaHei', 9)).pack(fill='x', padx=16)
+
+    log = ScrolledText(root, height=12, font=('Consolas', 9), state='disabled', wrap='word')
+    log.pack(fill='both', expand=True, padx=16, pady=(8, 14))
+
+    class _Writer:
+        """把 print 输出转到窗口日志，供后台线程使用"""
+
+        def write(self, text):
+            if not text:
+                return
+            try:
+                root.after(0, self._append, text)
+            except Exception:
+                pass
+
+        def _append(self, text):
+            try:
+                log.configure(state='normal')
+                log.insert('end', text)
+                log.see('end')
+                log.configure(state='disabled')
+            except Exception:
+                pass
+
+        def flush(self):
+            pass
+
+    def on_progress(done, total):
+        def update():
+            progress.configure(value=done / total * 100)
+            status_var.set(f'正在渲染 {done}/{total} 帧（{done / total * 100:.0f}%）')
+
+        try:
+            root.after(0, update)
+        except Exception:
+            pass
+
+    def finish(ok, payload):
+        state['running'] = False
+        start_btn.configure(state='normal')
+        if ok:
+            state['output_dir'] = payload
+            progress.configure(value=100)
+            status_var.set('处理完成，成片已生成')
+            open_btn.configure(state='normal')
+        else:
+            status_var.set('处理失败，详见下方日志')
+
+    def open_output():
+        if state['output_dir'] and os.path.isdir(state['output_dir']):
+            try:
+                os.startfile(state['output_dir'])
+            except Exception as e:
+                status_var.set(f'无法打开目录：{e}')
+
+    open_btn.configure(command=open_output)
+
+    def start():
+        if state['running']:
+            return
+        path = path_var.get().strip().strip('"').strip("'")
+        if not path:
+            messagebox.showwarning('提示', '请先选择视频文件或事件文件夹')
+            return
+        if not os.path.exists(path):
+            messagebox.showerror('找不到路径', path)
+            return
+
+        state['running'] = True
+        state['output_dir'] = None
+        start_btn.configure(state='disabled')
+        open_btn.configure(state='disabled')
+        progress.configure(value=0)
+        status_var.set('正在准备…')
+        log.configure(state='normal')
+        log.delete('1.0', 'end')
+        log.configure(state='disabled')
+
+        def run():
+            global _PROGRESS_HOOK
+            old_out, old_err = sys.stdout, sys.stderr
+            writer = _Writer()
+            sys.stdout = sys.stderr = writer
+            _PROGRESS_HOOK = on_progress
+            try:
+                if os.path.isfile(path):
+                    base, _ = os.path.splitext(path)
+                    ok = process_video(path, base + '_sei.csv', base + '_with_overlay.mp4', use_metric)
+                    output_dir = os.path.dirname(os.path.abspath(path))
+                else:
+                    process_folder(path, path, use_metric)
+                    ok = True
+                    output_dir = os.path.abspath(path)
+                root.after(0, finish, ok, output_dir)
+            except Exception:
+                traceback.print_exc()
+                root.after(0, finish, False, None)
+            finally:
+                _PROGRESS_HOOK = None
+                sys.stdout, sys.stderr = old_out, old_err
+
+        threading.Thread(target=run, daemon=True).start()
+
+    start_btn.configure(command=start)
+
+    if auto_start and initial_path:
+        root.after(300, start)
 
     root.mainloop()
-    return result['path']
+    return True
 
 
 if __name__ == '__main__':
@@ -2463,12 +2610,16 @@ if __name__ == '__main__':
         print(f"地图缓存已清空：删除 {removed} 个文件")
         sys.exit(0)
 
-    # 双击启动（无参数）时弹窗选择文件/文件夹，保持拖拽到 exe 上也能用
+    # 打包成无控制台的 windowed 程序时，统一走图形界面；拖拽路径进来会自动开始
+    if getattr(sys, 'frozen', False):
+        launch_gui(args.input, use_metric, auto_start=bool(args.input))
+        sys.exit(0)
+
+    # 源码运行：无参数时也弹窗口选择文件，保持拖拽到 exe 上也能用
     if not args.input:
-        selected = choose_target_gui()
-        if not selected:
-            parser.error('需要提供 input 视频/文件夹，或使用 --clear-map-cache')
-        args.input = selected
+        if launch_gui(None, use_metric):
+            sys.exit(0)
+        parser.error('需要提供 input 视频/文件夹，或使用 --clear-map-cache')
 
     if args.csv_only:
         process_csv_only(args.input)
