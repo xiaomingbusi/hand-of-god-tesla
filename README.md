@@ -4,8 +4,14 @@
 
 Tesla dashcam telemetry overlay — restore speed, pedals, blinkers, autopilot status, G-force and maps onto your USB clips.
 
-> **关于作者**：我不是程序员，也不懂代码，这个项目的代码全部由 AI 编程助手（Trae）生成。
+> **关于作者**：我不是程序员，也不懂代码，这个项目的代码全部由 AI 编程助手生成。
 > 功能是我拿真实行车视频一段段测出来的；AI 写的代码不代表完美，如果你发现代码层面的问题，欢迎提 Issue，我会继续让 AI 修。
+
+## 直接下载（推荐，不用装任何环境）
+
+**[下载 Windows 绿色版](https://github.com/xiaomingbusi/hand-of-god-tesla/releases/latest)**（仅 Windows 10/11 64 位）
+
+解压后双击 `上帝之手\tesla_overlay.exe`，选择视频文件或事件文件夹即可开始。首次运行如遇 SmartScreen 提示，点「更多信息 → 仍要运行」。不需要安装 Python、ffmpeg，也不用看下面的源码运行教程。
 
 ---
 
@@ -76,7 +82,9 @@ Tesla dashcam telemetry overlay — restore speed, pedals, blinkers, autopilot s
 
 ---
 
-## 小白安装指南（从零开始，约 10 分钟）
+## 从源码运行（可选，约 10 分钟）
+
+> 不想装环境？直接用上面的绿色版即可。以下步骤只给想从源码运行、或想自己改代码的人。
 
 本工具运行在电脑上，需要装三样东西：**Python、ffmpeg、Pillow（含 numpy）**。下面每一步都可以照抄。
 
@@ -127,7 +135,9 @@ pip install pillow numpy
 
 ## 使用方法
 
-### 方法一：拖拽（推荐，不用敲任何命令）
+绿色版：双击 `tesla_overlay.exe` 选文件即可，不需要下面的命令。
+
+### 方法一：拖拽（源码运行时）
 
 1. 把 U 盘插到电脑上，找到保存的事件文件夹（里面有 `event.json` 和各机位 mp4）
 2. 用鼠标把**整个文件夹**拖到本工具文件夹里的 **`拖入视频或文件夹到这里.bat`** 图标上
