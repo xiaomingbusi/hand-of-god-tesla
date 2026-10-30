@@ -75,7 +75,7 @@ Tesla dashcam telemetry overlay — restore speed, pedals, blinkers, autopilot s
 
 ## 小白安装指南（从零开始，约 10 分钟）
 
-本工具运行在电脑上，需要装三样东西：**Python、ffmpeg、Pillow**。下面每一步都可以照抄。
+本工具运行在电脑上，需要装三样东西：**Python、ffmpeg、Pillow（含 numpy）**。下面每一步都可以照抄。
 
 ### 第 1 步：安装 Python
 
@@ -102,12 +102,12 @@ winget install Gyan.FFmpeg
 
 > 如果提示找不到 winget（Win10 老版本），请更新系统或改用：Microsoft Store 搜索安装「应用安装程序」。
 
-### 第 3 步：安装 Pillow（图像处理库）
+### 第 3 步：安装 Pillow 与 numpy（图像处理库）
 
 在 PowerShell 里输入：
 
 ```powershell
-pip install pillow
+pip install pillow numpy
 ```
 
 ### 第 4 步（可选）：配置高德地图 Key
@@ -116,8 +116,7 @@ pip install pillow
 
 1. 打开 <https://lbs.amap.com> 注册登录
 2. 控制台 → 应用管理 → 我的应用 → 创建新应用 → 添加 Key，**服务平台选「Web 服务」**
-3. 复制 Key，粘贴进本项目文件夹里的 `amap_key.example.txt`
-4. 把该文件重命名为 `amap_key.txt`（去掉 `.example`）
+3. 复制 Key，把本项目里的 `amap_key.example.txt` 复制一份并改名为 `amap_key.txt`，把 Key 粘贴进去
 
 个人开发者每日免费 5000 次，本工具每次处理只调用几次，完全够用。
 

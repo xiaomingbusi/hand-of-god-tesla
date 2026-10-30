@@ -1,1 +1,5 @@
 Pillow>=10.0.0
+numpy>=1.24
+
+# 仅打包绿色版时需要
+pyinstaller>=6.10

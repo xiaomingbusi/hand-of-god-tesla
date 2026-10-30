@@ -19,6 +19,13 @@ amap_key.txt
 *.csv
 *.json
 
+# ===== 打包产物 =====
+绿色版/
+build/
+dist/
+temp_frames_*/
+assets/_unused/
+
 # ===== 系统/编辑器杂项 =====
 Thumbs.db
 ehthumbs.db

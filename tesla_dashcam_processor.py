@@ -1,6 +1,7 @@
 import csv
 import os
 import re
+import sys
 import struct
 import subprocess
 import math
@@ -93,8 +94,38 @@ def load_event_info(video_path):
         print(f"Warning: failed to parse {event_path}: {e}")
         return None
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ICON_PATH = os.path.join(SCRIPT_DIR, 'assets')
+def _base_dir():
+    """打包后返回 exe 所在目录，源码运行时返回脚本目录（缓存、配置写这里）"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _resource_dir():
+    """只读资源目录：PyInstaller 打包后资源在 sys._MEIPASS 下"""
+    meipass = getattr(sys, '_MEIPASS', None)
+    if getattr(sys, 'frozen', False) and meipass:
+        return meipass
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _find_tool(name):
+    """优先用随包附带的 bin/<name>.exe，其次回退到系统 PATH"""
+    bundled = os.path.join(_resource_dir(), 'bin', f'{name}.exe')
+    if os.path.exists(bundled):
+        return bundled
+    return shutil.which(name) or name
+
+
+SCRIPT_DIR = _base_dir()
+RESOURCE_DIR = _resource_dir()
+ICON_PATH = os.path.join(RESOURCE_DIR, 'assets')
+FFMPEG = _find_tool('ffmpeg')
+FFPROBE = _find_tool('ffprobe')
+# 中文字体：优先用随包附带的 assets/simhei.ttf，避免依赖目标机器系统字体
+SIMHEI_FONT = os.path.join(ICON_PATH, 'simhei.ttf')
+if not os.path.exists(SIMHEI_FONT):
+    SIMHEI_FONT = 'simhei.ttf'
 
 # ===== 真实地图：OSM 瓦片（方案B：缓存合成图 + 上限淘汰）=====
 # 合成后的地图图缓存在脚本旁的 .map_cache，超过上限按最久未用淘汰
@@ -664,7 +695,7 @@ def _autocorr_period(video_path, speeds, meas_fps=36.0, width=480, step=0.02):
         except Exception:
             est = 0
         print(f"校准 1/2: 抽取分析帧(预计约{est}帧,需几分钟)...", flush=True)
-        proc = subprocess.Popen(['ffmpeg', '-v', 'quiet', '-y', '-i', video_path,
+        proc = subprocess.Popen([FFMPEG, '-v', 'quiet', '-y', '-i', video_path,
                                  '-vf', 'fps=%g,scale=%d:-2' % (meas_fps, width),
                                  '-pix_fmt', 'gray', os.path.join(tmp, 'f_%05d.png')],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1947,14 +1978,14 @@ def generate_overlay_frame(sei, frame_index, output_dir, base_time, video_width=
     size_gear = max(10, int(row_h * 0.55))  # 档位字母在圆圈内，字号需小于圆径
 
     try:
-        font_num = ImageFont.truetype('simhei.ttf', size_num)
-        font_unit = ImageFont.truetype('simhei.ttf', size_unit)
-        font_info = ImageFont.truetype('simhei.ttf', size_info)
-        font_ap = ImageFont.truetype('simhei.ttf', size_ap)
-        font_gear = ImageFont.truetype('simhei.ttf', size_gear)
-        font_gforce = ImageFont.truetype('simhei.ttf', int(14 * scale))
-        font_map = ImageFont.truetype('simhei.ttf', int(34 * scale))
-        font_map_small = ImageFont.truetype('simhei.ttf', int(20 * scale))
+        font_num = ImageFont.truetype(SIMHEI_FONT, size_num)
+        font_unit = ImageFont.truetype(SIMHEI_FONT, size_unit)
+        font_info = ImageFont.truetype(SIMHEI_FONT, size_info)
+        font_ap = ImageFont.truetype(SIMHEI_FONT, size_ap)
+        font_gear = ImageFont.truetype(SIMHEI_FONT, size_gear)
+        font_gforce = ImageFont.truetype(SIMHEI_FONT, int(14 * scale))
+        font_map = ImageFont.truetype(SIMHEI_FONT, int(34 * scale))
+        font_map_small = ImageFont.truetype(SIMHEI_FONT, int(20 * scale))
     except:
         font_num = ImageFont.load_default()
         font_unit = ImageFont.load_default()
@@ -2210,7 +2241,7 @@ def generate_overlay_frames(sei_data, output_dir, base_time, video_width=1920, v
 
 def get_video_info(video_path):
     result = subprocess.run(
-        ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+        [FFPROBE, '-v', 'quiet', '-print_format', 'json',
          '-show_entries', 'format=duration', video_path],
         capture_output=True, text=True, encoding='utf-8', errors='replace'
     )
@@ -2218,7 +2249,7 @@ def get_video_info(video_path):
     duration_ms = float(data['format']['duration']) * 1000
 
     result = subprocess.run(
-        ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+        [FFPROBE, '-v', 'quiet', '-print_format', 'json',
          '-show_entries', 'stream=width,height', video_path],
         capture_output=True, text=True, encoding='utf-8', errors='replace'
     )
@@ -2235,7 +2266,7 @@ def get_video_info(video_path):
 
 def get_video_duration(video_path):
     result = subprocess.run(
-        ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+        [FFPROBE, '-v', 'quiet', '-print_format', 'json',
          '-show_entries', 'format=duration', video_path],
         capture_output=True, text=True, encoding='utf-8', errors='replace'
     )
@@ -2304,7 +2335,7 @@ def process_video(input_video, input_csv, output_video, use_metric=True):
     frame_rate = len(sei_data) / (video_duration / 1000)
 
     ffmpeg_cmd = [
-        'ffmpeg', '-i', input_video,
+        FFMPEG, '-i', input_video,
         '-framerate', str(frame_rate), '-i', os.path.join(temp_dir, 'overlay_%06d.png'),
         '-filter_complex', "[0:v][1:v]overlay=0:0[vout]",
         '-map', '[vout]',
@@ -2363,6 +2394,52 @@ def process_csv_only(input_path):
         print(f"Extracted {len(sei_data)} frames -> {csv_path}")
 
 
+def choose_target_gui():
+    """双击启动时弹出的选择窗口，返回视频/文件夹路径；无图形环境返回 None"""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+
+    result = {'path': None}
+    root = tk.Tk()
+    root.title('上帝之手 · 特斯拉行车视频还原')
+    root.geometry('430x200')
+    root.resizable(False, False)
+    try:
+        root.iconbitmap(os.path.join(ICON_PATH, 'HandOfGod.ico'))
+    except Exception:
+        pass
+
+    tk.Label(root, text='选择要还原的 Tesla 行车视频',
+             font=('Microsoft YaHei', 12, 'bold')).pack(pady=(20, 4))
+    tk.Label(root, text='成片保存在原视频同目录，文件名带 _with_overlay',
+             font=('Microsoft YaHei', 9), fg='#666666').pack()
+
+    def pick_file():
+        path = filedialog.askopenfilename(
+            title='选择视频文件',
+            filetypes=[('MP4 视频', '*.mp4'), ('所有文件', '*.*')])
+        if path:
+            result['path'] = path
+            root.destroy()
+
+    def pick_dir():
+        path = filedialog.askdirectory(title='选择事件文件夹（含 MP4 与 event.json）')
+        if path:
+            result['path'] = path
+            root.destroy()
+
+    btns = tk.Frame(root)
+    btns.pack(pady=18)
+    tk.Button(btns, text='选择视频文件', width=14, command=pick_file).pack(side='left', padx=8)
+    tk.Button(btns, text='选择事件文件夹', width=14, command=pick_dir).pack(side='left', padx=8)
+
+    root.mainloop()
+    return result['path']
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -2384,9 +2461,16 @@ if __name__ == '__main__':
     if args.clear_map_cache:
         removed = clear_map_cache()
         print(f"地图缓存已清空：删除 {removed} 个文件")
-    elif not args.input:
-        parser.error('需要提供 input 视频/文件夹，或使用 --clear-map-cache')
-    elif args.csv_only:
+        sys.exit(0)
+
+    # 双击启动（无参数）时弹窗选择文件/文件夹，保持拖拽到 exe 上也能用
+    if not args.input:
+        selected = choose_target_gui()
+        if not selected:
+            parser.error('需要提供 input 视频/文件夹，或使用 --clear-map-cache')
+        args.input = selected
+
+    if args.csv_only:
         process_csv_only(args.input)
     elif os.path.isfile(args.input):
         # 省略 output 时，自动在原视频旁生成 原名_with_overlay.mp4
